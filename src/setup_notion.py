@@ -1,4 +1,9 @@
-"""One-time helper: create the Notion database with the correct schema.
+"""One-time helper: create the Notion database the sync writes into.
+
+Because the sync adds columns on the fly to match whatever the CSV export
+contains, this only needs to create a database with the fixed columns:
+the title (Ad Name), the reporting window (Week Start / Week Ending) and
+Synced On. Everything else appears automatically on the first sync.
 
 Usage:
     # Share a Notion *page* with your integration first, then:
@@ -7,11 +12,7 @@ Usage:
     # or pass the parent page id via env:
     NOTION_TOKEN=... NOTION_PARENT_PAGE_ID=... python -m src.setup_notion
 
-It prints the new database id. Put that value into NOTION_DATABASE_ID (locally in
-.env, and as a GitHub Actions secret) so the weekly sync knows where to write.
-
-You only need to run this once. If you'd rather build the database by hand, the
-required columns are listed in the README.
+It prints the new database id. Put that value into NOTION_DATABASE_ID.
 """
 
 from __future__ import annotations
@@ -21,28 +22,24 @@ import sys
 
 import requests
 
-from .schema import PROPERTIES
+from .schema import (
+    DEFAULT_TITLE_PROP,
+    SYNCED_PROP,
+    WEEK_END_PROP,
+    WEEK_START_PROP,
+    notion_property_spec,
+)
 
 NOTION_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
 
-def _schema_property(ntype: str, number_format: str | None) -> dict:
-    if ntype == "title":
-        return {"title": {}}
-    if ntype == "rich_text":
-        return {"rich_text": {}}
-    if ntype == "date":
-        return {"date": {}}
-    if ntype == "number":
-        return {"number": {"format": number_format or "number"}}
-    raise ValueError(f"Unsupported property type: {ntype}")
-
-
 def build_schema() -> dict:
     return {
-        name: _schema_property(ntype, number_format)
-        for _key, name, ntype, number_format in PROPERTIES
+        DEFAULT_TITLE_PROP: notion_property_spec("title"),
+        WEEK_START_PROP: notion_property_spec("date"),
+        WEEK_END_PROP: notion_property_spec("date"),
+        SYNCED_PROP: notion_property_spec("date"),
     }
 
 
@@ -95,7 +92,7 @@ def main() -> int:
     print(f"   Database id:  {db_id}")
     if url:
         print(f"   URL:          {url}")
-    print("\nNext: set this as NOTION_DATABASE_ID (in .env and as a GitHub secret):")
+    print("\nNext: set this as NOTION_DATABASE_ID (in .env, or in your environment):")
     print(f"   NOTION_DATABASE_ID={db_id}\n")
     return 0
 

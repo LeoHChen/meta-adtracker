@@ -1,8 +1,11 @@
-"""Write per-ad metrics into a Notion database.
+"""Write parsed Meta metrics into a Notion database, adapting the database
+schema to whatever columns the export contains.
 
-Uses an upsert strategy keyed on (Ad ID, Week Ending): if a row for that ad and
-week already exists it is updated in place, otherwise a new row is created. This
-makes re-running the sync for the same week idempotent.
+Flow:
+1. ``ensure_schema`` reads the target database, discovers its title property,
+   and adds any columns present in the export but missing from the database.
+2. ``upsert_row`` writes one ad's row, keyed on (title, reporting window) so
+   re-uploading the same week updates in place instead of duplicating.
 """
 
 from __future__ import annotations
@@ -13,16 +16,20 @@ from typing import Any
 
 import requests
 
-from .schema import DEDUPE_ID_PROP, PROPERTIES, WEEK_PROP
+from .csv_parser import ExportData
+from .schema import (
+    SYNCED_PROP,
+    WEEK_END_PROP,
+    WEEK_START_PROP,
+    notion_property_spec,
+    notion_property_value,
+)
 
 log = logging.getLogger(__name__)
 
 NOTION_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
-
-# Notion caps rich_text / title content at 2000 characters per item.
-_MAX_TEXT = 2000
 
 
 class NotionApiError(RuntimeError):
@@ -47,15 +54,50 @@ class NotionWriter:
                 "Content-Type": "application/json",
             }
         )
+        self.title_prop = "Name"  # replaced by ensure_schema()
 
-    # -- public API -------------------------------------------------------
+    # -- schema -----------------------------------------------------------
 
-    def upsert_ad(self, ad: dict[str, Any], week_ending: str, report_date: str) -> str:
-        """Create or update the row for one ad/week. Returns "created" or "updated"."""
-        record = {**ad, "week_ending": week_ending, "report_date": report_date}
-        props = self._build_properties(record)
+    def ensure_schema(self, export: ExportData) -> str:
+        """Add any missing columns to the database. Returns the title property
+        name (discovered from the database, since Notion allows only one)."""
+        db = self._request("GET", f"/databases/{self.database_id}", None)
+        existing = db.get("properties", {})
+        self.title_prop = _find_title_prop(existing)
 
-        existing_id = self._find_existing(ad["ad_id"], week_ending)
+        to_add: dict[str, Any] = {}
+        if export.has_week_start and WEEK_START_PROP not in existing:
+            to_add[WEEK_START_PROP] = notion_property_spec("date")
+        if export.has_week_ending and WEEK_END_PROP not in existing:
+            to_add[WEEK_END_PROP] = notion_property_spec("date")
+        if SYNCED_PROP not in existing:
+            to_add[SYNCED_PROP] = notion_property_spec("date")
+        for col in export.columns:
+            if col.name != self.title_prop and col.name not in existing and col.name not in to_add:
+                to_add[col.name] = notion_property_spec(col.ntype, col.number_format)
+
+        if to_add:
+            self._request("PATCH", f"/databases/{self.database_id}", {"properties": to_add})
+            log.info("Added %d new column(s) to Notion: %s", len(to_add), ", ".join(to_add))
+        return self.title_prop
+
+    # -- rows -------------------------------------------------------------
+
+    def upsert_row(self, row: dict[str, Any], export: ExportData, synced_on: str) -> str:
+        """Create or update one ad's row. Returns "created" or "updated"."""
+        props: dict[str, Any] = {
+            self.title_prop: notion_property_value("title", row["title"]),
+            SYNCED_PROP: notion_property_value("date", synced_on),
+        }
+        if export.has_week_start:
+            props[WEEK_START_PROP] = notion_property_value("date", row.get("week_start"))
+        if export.has_week_ending:
+            props[WEEK_END_PROP] = notion_property_value("date", row.get("week_ending"))
+        for name, (ntype, value) in row["fields"].items():
+            if name != self.title_prop:
+                props[name] = notion_property_value(ntype, value)
+
+        existing_id = self._find_existing(row, export, synced_on)
         if existing_id:
             self._request("PATCH", f"/pages/{existing_id}", {"properties": props})
             return "updated"
@@ -67,32 +109,36 @@ class NotionWriter:
         )
         return "created"
 
-    # -- internals --------------------------------------------------------
+    def _find_existing(
+        self, row: dict[str, Any], export: ExportData, synced_on: str
+    ) -> str | None:
+        conditions: list[dict[str, Any]] = [
+            {"property": self.title_prop, "title": {"equals": row["title"]}}
+        ]
+        if export.has_week_ending and row.get("week_ending"):
+            conditions.append(
+                {"property": WEEK_END_PROP, "date": {"equals": row["week_ending"]}}
+            )
+        if export.has_week_start and row.get("week_start"):
+            conditions.append(
+                {"property": WEEK_START_PROP, "date": {"equals": row["week_start"]}}
+            )
+        # No reporting window in the export: fall back to the sync date so a
+        # same-day re-run updates rather than duplicates.
+        if not (export.has_week_start or export.has_week_ending):
+            conditions.append({"property": SYNCED_PROP, "date": {"equals": synced_on}})
 
-    def _find_existing(self, ad_id: str, week_ending: str) -> str | None:
-        body = {
-            "filter": {
-                "and": [
-                    {"property": DEDUPE_ID_PROP, "rich_text": {"equals": ad_id}},
-                    {"property": WEEK_PROP, "date": {"equals": week_ending}},
-                ]
-            },
-            "page_size": 1,
-        }
         payload = self._request(
-            "POST", f"/databases/{self.database_id}/query", body
+            "POST",
+            f"/databases/{self.database_id}/query",
+            {"filter": {"and": conditions}, "page_size": 1},
         )
         results = payload.get("results", [])
         return results[0]["id"] if results else None
 
-    def _build_properties(self, record: dict[str, Any]) -> dict[str, Any]:
-        props: dict[str, Any] = {}
-        for key, name, ntype, _fmt in PROPERTIES:
-            value = record.get(key)
-            props[name] = _notion_value(ntype, value)
-        return props
+    # -- transport --------------------------------------------------------
 
-    def _request(self, method: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _request(self, method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
         url = f"{NOTION_BASE}{path}"
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -106,7 +152,6 @@ class NotionWriter:
 
             message = self._extract_error(resp)
             if resp.status_code in _RETRY_STATUSES and attempt < self.max_retries:
-                # Honour Retry-After for 429s when present.
                 retry_after = resp.headers.get("Retry-After")
                 delay = float(retry_after) if retry_after else min(2 ** attempt, 30)
                 log.warning("Retrying Notion %s in %.0fs: %s", path, delay, message)
@@ -132,18 +177,9 @@ class NotionWriter:
         time.sleep(delay)
 
 
-def _notion_value(ntype: str, value: Any) -> dict[str, Any]:
-    """Convert a raw metric value into a Notion property value object."""
-    if ntype == "title":
-        return {"title": [{"text": {"content": _text(value) or "(unnamed ad)"}}]}
-    if ntype == "rich_text":
-        return {"rich_text": [{"text": {"content": _text(value)}}]}
-    if ntype == "number":
-        return {"number": value if isinstance(value, (int, float)) else None}
-    if ntype == "date":
-        return {"date": {"start": value} if value else None}
-    raise ValueError(f"Unsupported Notion property type: {ntype}")
-
-
-def _text(value: Any) -> str:
-    return ("" if value is None else str(value))[:_MAX_TEXT]
+def _find_title_prop(properties: dict[str, Any]) -> str:
+    for name, spec in properties.items():
+        if spec.get("type") == "title" or "title" in spec:
+            return name
+    # A well-formed Notion database always has a title; fall back defensively.
+    return "Name"

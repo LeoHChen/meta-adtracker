@@ -1,180 +1,152 @@
-# Meta Ads → Notion Weekly Sync
+# Meta Ads CSV → Notion
 
-Automatically pulls last week's performance for **every ad** in your Meta (Facebook)
-ad account and writes it into a **Notion database** — one row per ad, per week —
-every **Friday**, via GitHub Actions.
+Turn a **Meta Ads Manager CSV export** into rows in a **Notion database** — one
+row per ad, per reporting week. You export the CSV from Ads Manager (no Meta API,
+no app, no access token), hand it to the script, and it writes the numbers into
+Notion.
 
-Re-runs are safe: a row is keyed on _(Ad ID, Week Ending)_, so running again for
-the same week **updates** the existing row instead of creating duplicates.
+**Schema-adaptive:** you can change which columns you export from week to week.
+The parser reads whatever columns are in the CSV, figures out each one's type
+(number / date / text), and **any column that doesn't exist in your Notion
+database yet is created automatically** on the next sync. New metric next week
+(Purchases, ROAS, video views, …)? It just shows up as a new Notion column.
 
-## What gets synced
+Re-running the same export is safe: rows are keyed on _(ad name, reporting
+window)_, so a re-upload **updates** the existing rows instead of duplicating.
 
-For each ad, over the reporting window (the 7 days ending yesterday, by default):
-
-| Column | Source |
-| --- | --- |
-| Ad Name, Ad ID, Campaign, Ad Set | ad metadata |
-| Week Ending, Report Date | the window end date / the day it ran |
-| Spend | `spend` |
-| Impressions, Reach, Clicks | `impressions`, `reach`, `clicks` |
-| CTR (%), CPC, CPM, Frequency | `ctr`, `cpc`, `cpm`, `frequency` |
-| Purchases, Purchase Value | from `actions` / `action_values` |
-| ROAS | `purchase_roas` (falls back to value ÷ spend) |
-
-Want different columns? Edit [`src/schema.py`](src/schema.py) — it's the single
-source of truth for both the database setup and the writer. To pull extra Meta
-fields, add them to `INSIGHT_FIELDS` and `parse_row` in
-[`src/meta_client.py`](src/meta_client.py).
-
-## How it fits together
+## How it works
 
 ```
-GitHub Actions (cron: Fridays)         .github/workflows/weekly-sync.yml
-        │
-        ▼
-python -m src.sync                     src/sync.py      (orchestration)
-    ├── MetaAdsClient.fetch_ad_insights   src/meta_client.py  (Graph API)
-    └── NotionWriter.upsert_ad            src/notion_writer.py (Notion API)
+Ads Manager  --export CSV-->  python -m src.sync export.csv
+                                   │
+                     src/csv_parser.py   parse + infer column types, skip the
+                                         account-total row
+                                   │
+                     src/notion_writer.py  add any missing columns to the DB,
+                                           then upsert one row per ad
+                                   ▼
+                              Notion database
 ```
+
+Fixed columns always present: **Ad Name** (title), **Week Start**, **Week
+Ending** (from the export's reporting dates), and **Synced On** (when it ran).
+Everything else mirrors your export.
 
 ---
 
-## Setup
+## One-time setup
 
-You'll do this once. Roughly: get a Meta token, create a Notion integration +
-database, then store four secrets in GitHub.
+### 1. Create a Notion integration
 
-### 1. Meta Marketing API access
+1. Go to <https://www.notion.so/my-integrations> → **New integration** →
+   copy the **Internal Integration Secret**. That's your `NOTION_TOKEN`.
 
-You need an access token with the **`ads_read`** permission and your **ad
-account id**.
+### 2. Create the database
 
-1. Create an app at <https://developers.facebook.com/apps> (type: *Business*).
-2. Add the **Marketing API** product.
-3. Get a token:
-   - Quick start / short-lived: use the **Graph API Explorer**, select your app,
-     add the `ads_read` scope, and generate a token. Short-lived tokens expire in
-     ~1–2 hours — fine for a first test, not for the scheduled job.
-   - **Recommended for automation:** create a **System User** in
-     [Business Settings](https://business.facebook.com/settings) → *System users*,
-     assign it your ad account with `ads_read`, and generate a **long-lived
-     token**. These don't expire on a fixed clock the way user tokens do.
-4. Find your **ad account id** in Ads Manager (the `act_XXXXXXXXXX` in the URL, or
-   Account Overview). You can store it with or without the `act_` prefix.
-
-Verify your token works:
-
-```bash
-curl -G "https://graph.facebook.com/v21.0/act_<YOUR_ID>/insights" \
-  --data-urlencode "fields=ad_name,spend" \
-  --data-urlencode "level=ad" \
-  --data-urlencode "date_preset=last_7d" \
-  --data-urlencode "access_token=<YOUR_TOKEN>"
-```
-
-> If the API version in the URL is rejected as deprecated, bump it to the current
-> version from the [changelog](https://developers.facebook.com/docs/graph-api/changelog)
-> and set `META_API_VERSION` accordingly.
-
-### 2. Notion integration + database
-
-1. Create an internal integration at <https://www.notion.so/my-integrations>
-   and copy its **Internal Integration Secret** (this is `NOTION_TOKEN`).
-2. In Notion, open (or create) a page that will hold the metrics database, then
-   **Share** that page with your integration (`•••` menu → *Connections* →
-   your integration).
-3. Get the **parent page id**: it's the 32-character hex string in the page URL
-   (e.g. `https://www.notion.so/My-Page-`**`8a1b...c3`**).
-4. Create the database automatically with the correct schema:
+1. In Notion, open (or make) a page to hold the database, then **Share** it
+   with your integration (`•••` → *Connections* → your integration).
+2. Copy that page's id — the 32-char hex string in its URL.
+3. Create the database with the correct starting columns:
 
    ```bash
    pip install -r requirements.txt
    NOTION_TOKEN=secret_xxx python -m src.setup_notion <parent_page_id> "Meta Ads — Weekly Metrics"
    ```
 
-   It prints a **database id** — that's your `NOTION_DATABASE_ID`. (Prefer to
-   build it by hand? Create a database with the columns from the table above,
-   matching the names and types in `src/schema.py`.)
+   It prints a **database id** — that's your `NOTION_DATABASE_ID`.
 
-### 3. Test locally (optional but recommended)
+   > Prefer an existing database? Just share it with the integration and use its
+   > id. The sync will add any missing columns itself; it only needs the title
+   > column to exist (every Notion database has one).
+
+### 3. Store your two secrets
 
 ```bash
-cp .env.example .env      # then fill in the four values
-# Dry run first — prints a table, writes nothing to Notion:
-DRY_RUN=true python -m src.sync
-# Then a real run:
-python -m src.sync
+cp .env.example .env     # then fill in NOTION_TOKEN and NOTION_DATABASE_ID
 ```
 
-### 4. Wire up GitHub Actions
+---
 
-Add these four **repository secrets** under
-*Settings → Secrets and variables → Actions → New repository secret*:
+## Weekly workflow
 
-| Secret | Value |
-| --- | --- |
-| `META_ACCESS_TOKEN` | your long-lived Meta token |
-| `META_AD_ACCOUNT_ID` | e.g. `act_1234567890` (or just `1234567890`) |
-| `NOTION_TOKEN` | your Notion integration secret |
-| `NOTION_DATABASE_ID` | the id printed by `setup_notion` |
+### 1. Export the CSV from Ads Manager
 
-Optionally add a repository **variable** `META_API_VERSION` (e.g. `v21.0`) to
-override the Graph API version without touching code.
+- Ads Manager → **Reports** (or the **Ads** tab) → set the **date range** to the
+  week you want, pick your columns, and **Export → CSV**.
+- Any columns work. Tip: set a **weekly** date range (e.g. the last 7 days) so
+  each export is a distinct week — the reporting dates in the file become the
+  `Week Start` / `Week Ending` used to key the rows.
 
-Then the workflow in [`.github/workflows/weekly-sync.yml`](.github/workflows/weekly-sync.yml)
-runs every **Friday at 15:00 UTC**. Two important notes:
+### 2. Sync it
 
-- **It must be on your default branch to run on schedule.** GitHub only fires
-  scheduled workflows from the default branch. Merge this branch first.
-- **Test it immediately without waiting for Friday:** go to the **Actions** tab →
-  *Weekly Meta Ads → Notion Sync* → **Run workflow**. You can tick *dry run* and
-  set a custom look-back for that manual run.
+```bash
+# Preview first — prints a table, writes nothing:
+DRY_RUN=true python -m src.sync path/to/export.csv
 
-To change the schedule, edit the `cron` line (it's in **UTC**). For example
-`0 21 * * 5` is Friday 9pm UTC. To change the time zone reference, adjust the
-hour accordingly — cron has no time-zone field.
+# Then the real thing:
+python -m src.sync path/to/export.csv
+```
+
+That's it. The account-total row (blank ad name) is skipped automatically.
+
+### Two ways to run it every Friday
+
+- **You run it** locally with the command above.
+- **Hand the CSV to Claude Code and ask it to sync** — with `NOTION_TOKEN` and
+  `NOTION_DATABASE_ID` available in the environment, it runs the same command
+  for you. See "Running it with Claude" below.
+
+---
+
+## Running it with Claude
+
+If you'd rather just drop the file in a chat each week and say "update Notion":
+
+1. Set `NOTION_TOKEN` and `NOTION_DATABASE_ID` as **environment variables /
+   secrets** in your Claude Code environment (so they persist between sessions).
+2. Each Friday: upload the CSV export and ask Claude to run the sync. It will
+   execute `python -m src.sync <your-file>` and report what it created/updated.
+
+(Optional) Claude can also set a **recurring Friday reminder** so you don't
+forget to export and send the file.
 
 ---
 
 ## Configuration reference
 
-All configuration is via environment variables (see [`.env.example`](.env.example)):
-
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `META_ACCESS_TOKEN` | ✅ | — | Meta token with `ads_read` |
-| `META_AD_ACCOUNT_ID` | ✅ | — | Ad account, `act_` prefix optional |
-| `META_API_VERSION` | — | `v21.0` | Graph API version |
 | `NOTION_TOKEN` | ✅¹ | — | Notion integration secret |
 | `NOTION_DATABASE_ID` | ✅¹ | — | Target database id |
-| `LOOKBACK_DAYS` | — | `7` | Window length, ending yesterday |
-| `MIN_SPEND` | — | `0` | Skip ads spending below this |
-| `DRY_RUN` | — | `false` | Print instead of writing to Notion |
+| `CSV_PATH` | — | — | CSV path (alternative to the CLI argument) |
+| `MIN_SPEND` | — | `0` | Skip ads spending below this (needs a spend column) |
+| `DRY_RUN` | — | `false` | Print the parsed metrics instead of writing |
 
 ¹ Not required when `DRY_RUN=true`.
 
-## Troubleshooting
+## Notes & troubleshooting
 
-- **`Configuration error: Missing required environment variable`** — a secret
-  isn't set. Check the four secrets / your `.env`.
-- **Meta `HTTP 400, code 190`** — the token is invalid or expired. Regenerate it
-  (use a System User token for longevity).
-- **Meta `code 17` / `613`** — you hit a rate limit; the client already retries
-  with backoff, but very large accounts may need a narrower window.
-- **Notion `HTTP 404` / `object not found`** — the database isn't shared with the
+- **Which row is the ad name?** The parser looks for an `Ad name` column (and
+  falls back to `Ad set name` / `Campaign name` / `Account name`). That column
+  becomes the row title.
+- **Column types** are inferred from the data: all-numeric → number (dollar
+  format for cost-like columns such as *Amount spent*, *CPC*, *CPM*), all-date →
+  date, otherwise text.
+- **No reporting dates in the export?** Rows are then keyed on _(ad name, sync
+  date)_, so a same-day re-run updates and a different day creates new rows. For
+  clean weekly history, keep the reporting-date columns in your export.
+- **Notion `404` / object not found** — the database isn't shared with the
   integration, or `NOTION_DATABASE_ID` is wrong.
-- **Notion `HTTP 400, ... is not a property that exists`** — the database columns
-  don't match `src/schema.py`. Re-create it with `setup_notion`, or rename the
-  columns to match.
-- **No rows appear** — Meta only returns ads that had delivery in the window. If
-  everything was paused all week, there's nothing to report.
+- **A column didn't appear in Notion** — check the integration has *Update
+  content* capability (internal integrations do by default); the sync needs it to
+  add columns.
 
 ## Development
 
 ```bash
 pip install -r requirements.txt
-python -m pytest        # runs the offline unit tests in tests/
+python -m pytest        # offline tests: parsing, type inference, Notion payloads
 ```
 
-The tests cover the metric parsing and the date-window logic and need no network
-access or credentials.
+The tests use `tests/fixtures/sample_export.csv`, which matches a real Ads
+Manager export, and need no network access or credentials.

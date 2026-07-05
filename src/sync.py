@@ -1,87 +1,129 @@
-"""Entry point: fetch last week's per-ad metrics from Meta and write them to
-Notion. Run with ``python -m src.sync``."""
+"""Entry point: read a Meta Ads Manager CSV export and write each ad's metrics
+into a Notion database, adapting the database columns to whatever the export
+contains.
+
+Usage:
+    python -m src.sync path/to/export.csv
+    DRY_RUN=true python -m src.sync path/to/export.csv   # preview, don't write
+    python -m src.sync                                    # uses CSV_PATH env var
+"""
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
-from datetime import date, timedelta
+from datetime import date
 
 from .config import Config, ConfigError, load_config
-from .meta_client import MetaAdsClient, MetaApiError
+from .csv_parser import CsvError, ExportData, parse_meta_csv
 from .notion_writer import NotionApiError, NotionWriter
 
 log = logging.getLogger("meta_ads_sync")
 
 
-def compute_window(lookback_days: int, today: date | None = None) -> tuple[str, str]:
-    """Return (since, until) as YYYY-MM-DD for the reporting window.
-
-    The window ends yesterday (Meta's numbers for the current day are still
-    settling) and spans ``lookback_days`` days inclusive.
-    """
-    today = today or date.today()
-    until = today - timedelta(days=1)
-    since = until - timedelta(days=lookback_days - 1)
-    return since.isoformat(), until.isoformat()
-
-
-def run(cfg: Config) -> int:
-    since, until = compute_window(cfg.lookback_days)
-    report_date = date.today().isoformat()
-    log.info("Reporting window: %s .. %s (report date %s)", since, until, report_date)
-
-    meta = MetaAdsClient(
-        access_token=cfg.meta_access_token,
-        account_path=cfg.account_path,
-        api_version=cfg.meta_api_version,
+def resolve_csv_path(argv: list[str]) -> str:
+    if len(argv) > 1 and argv[1].strip():
+        return argv[1]
+    env_path = os.environ.get("CSV_PATH", "").strip()
+    if env_path:
+        return env_path
+    raise ConfigError(
+        "No CSV file given. Pass the export path as an argument "
+        "(python -m src.sync export.csv) or set CSV_PATH."
     )
-    ads = meta.fetch_ad_insights(since, until)
 
+
+def _row_spend(row: dict) -> float | None:
+    """Best-effort spend for the min-spend filter: the first numeric field whose
+    column name looks like an amount-spent column."""
+    for name, (ntype, value) in row["fields"].items():
+        if ntype == "number" and ("amount spent" in name.lower() or "spend" in name.lower()):
+            return value
+    return None
+
+
+def run(cfg: Config, csv_path: str) -> int:
+    export = parse_meta_csv(csv_path)
+    log.info(
+        "Parsed %d ad row(s) from %s (skipped %d total/blank row(s)).",
+        len(export.rows), csv_path, export.skipped,
+    )
+    log.info("Detected columns: %s", _describe_columns(export))
+
+    rows = export.rows
     if cfg.min_spend > 0:
-        before = len(ads)
-        ads = [a for a in ads if a["spend"] >= cfg.min_spend]
-        log.info("Filtered to %d/%d ads with spend >= %.2f", len(ads), before, cfg.min_spend)
+        before = len(rows)
+        filtered = [r for r in rows if (_row_spend(r) or 0) >= cfg.min_spend]
+        if before and len(filtered) == before and all(_row_spend(r) is None for r in rows):
+            log.warning("MIN_SPEND set but no spend column found; not filtering.")
+        else:
+            rows = filtered
+            log.info("Filtered to %d/%d ad(s) with spend >= %.2f", len(rows), before, cfg.min_spend)
 
-    if not ads:
-        log.warning("No ad data returned for this window. Nothing to sync.")
+    if not rows:
+        log.warning("No ad rows to sync.")
         return 0
 
     if cfg.dry_run:
-        _print_table(ads, since, until)
+        _print_preview(export, rows)
         log.info("DRY_RUN enabled -- not writing to Notion.")
         return 0
 
+    synced_on = date.today().isoformat()
     writer = NotionWriter(token=cfg.notion_token, database_id=cfg.notion_database_id)
+    title_prop = writer.ensure_schema(export)
+    log.info("Writing to Notion (title column: %r)...", title_prop)
+
     created = updated = failed = 0
-    for ad in ads:
+    for row in rows:
         try:
-            outcome = writer.upsert_ad(ad, week_ending=until, report_date=report_date)
+            outcome = writer.upsert_row(row, export, synced_on=synced_on)
             created += outcome == "created"
             updated += outcome == "updated"
-            log.info("  %-8s %s ($%.2f spend)", outcome, ad["ad_name"], ad["spend"])
+            log.info("  %-8s %s", outcome, row["title"])
         except NotionApiError as exc:
             failed += 1
-            log.error("  FAILED  %s: %s", ad["ad_name"], exc)
+            log.error("  FAILED  %s: %s", row["title"], exc)
 
     log.info("Done. %d created, %d updated, %d failed.", created, updated, failed)
     return 1 if failed else 0
 
 
-def _print_table(ads, since: str, until: str) -> None:
-    log.info("Metrics for %s .. %s (%d ads):", since, until, len(ads))
-    header = f"{'Ad':<40} {'Spend':>10} {'Impr':>10} {'Clicks':>8} {'CTR%':>7} {'ROAS':>7}"
+def _describe_columns(export: ExportData) -> str:
+    parts = []
+    if export.has_week_start or export.has_week_ending:
+        parts.append("Week Start/Ending (date)")
+    for col in export.columns:
+        fmt = f", {col.number_format}" if col.ntype == "number" and col.number_format else ""
+        parts.append(f"{col.name} ({col.ntype}{fmt})")
+    return "; ".join(parts)
+
+
+def _print_preview(export: ExportData, rows: list[dict]) -> None:
+    window = ""
+    if rows and (rows[0].get("week_start") or rows[0].get("week_ending")):
+        window = f"  ({rows[0].get('week_start')} .. {rows[0].get('week_ending')})"
+    print(f"\nWould sync {len(rows)} ad(s){window}:\n")
+    numeric_cols = [c.name for c in export.columns if c.ntype == "number"]
+    show = numeric_cols[:5]
+    header = f"{'Ad':<32}" + "".join(f"{c[:12]:>14}" for c in show)
     print(header)
     print("-" * len(header))
-    for a in ads:
-        name = a["ad_name"][:38]
-        print(
-            f"{name:<40} {a['spend']:>10.2f} {a['impressions']:>10} "
-            f"{a['clicks']:>8} {a['ctr']:>7.2f} {a['roas']:>7.2f}"
-        )
-    totals_spend = sum(a["spend"] for a in ads)
+    for row in rows:
+        line = f"{row['title'][:30]:<32}"
+        for c in show:
+            val = row["fields"].get(c, (None, None))[1]
+            line += f"{(val if val is not None else 0):>14.2f}" if isinstance(val, (int, float)) else f"{'':>14}"
+        print(line)
     print("-" * len(header))
-    print(f"{'TOTAL':<40} {totals_spend:>10.2f}")
+    if numeric_cols:
+        totals = f"{'TOTAL':<32}"
+        for c in show:
+            s = sum((row["fields"].get(c, (None, 0))[1] or 0) for row in rows if isinstance(row["fields"].get(c, (None, None))[1], (int, float)))
+            totals += f"{s:>14.2f}"
+        print(totals)
+    print()
 
 
 def main() -> int:
@@ -92,11 +134,18 @@ def main() -> int:
     )
     try:
         cfg = load_config()
-        return run(cfg)
+        csv_path = resolve_csv_path(sys.argv)
+        return run(cfg, csv_path)
     except ConfigError as exc:
         log.error("Configuration error: %s", exc)
         return 2
-    except (MetaApiError, NotionApiError) as exc:
+    except CsvError as exc:
+        log.error("Could not read CSV: %s", exc)
+        return 2
+    except FileNotFoundError as exc:
+        log.error("CSV file not found: %s", exc)
+        return 2
+    except NotionApiError as exc:
         log.error("%s", exc)
         return 1
 

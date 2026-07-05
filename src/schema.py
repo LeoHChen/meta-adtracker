@@ -1,42 +1,62 @@
-"""Single source of truth for the Notion database schema.
+"""Notion property helpers and the small set of *fixed* columns.
 
-Both ``setup_notion.py`` (which creates the database) and ``notion_writer.py``
-(which writes rows into it) build their payloads from ``PROPERTIES`` so the two
-can never drift apart. If you want to rename a column or change a number
-format, do it here once.
+The design is schema-adaptive: whatever columns appear in the Meta CSV export
+become Notion columns automatically (see ``csv_parser`` for type inference and
+``notion_writer`` for on-the-fly column creation). Only a few columns are fixed
+and always present:
 
-Each entry is ``(metric_key, notion_property_name, notion_type, number_format)``
-where ``metric_key`` matches the keys produced by ``meta_client.parse_row`` (plus
-``week_ending`` / ``report_date`` which the sync adds), and ``number_format`` is
-only meaningful for ``number`` properties.
+- the **title** column (the ad name) — Notion requires exactly one title; we
+  discover its actual name from the target database at write time;
+- **Week Start** / **Week Ending** — the reporting window, when the export
+  includes reporting dates;
+- **Synced On** — the date the row was written, for provenance and as a dedupe
+  fallback when an export has no reporting dates.
+
+This module also centralises the translation between our internal type names
+(``title`` / ``rich_text`` / ``number`` / ``date``) and Notion's payload shapes,
+so the parser, the database-setup helper and the writer all agree.
 """
 
-# The metric key that becomes the row's title (every Notion DB needs exactly one
-# title property). We use the ad name.
-TITLE_KEY = "ad_name"
+from __future__ import annotations
 
-# (metric_key, notion_name, notion_type, number_format)
-PROPERTIES = [
-    ("ad_name",        "Ad Name",        "title",     None),
-    ("ad_id",          "Ad ID",          "rich_text", None),
-    ("campaign_name",  "Campaign",       "rich_text", None),
-    ("adset_name",     "Ad Set",         "rich_text", None),
-    ("week_ending",    "Week Ending",    "date",      None),
-    ("report_date",    "Report Date",    "date",      None),
-    ("spend",          "Spend",          "number",    "dollar"),
-    ("impressions",    "Impressions",    "number",    "number"),
-    ("reach",          "Reach",          "number",    "number"),
-    ("clicks",         "Clicks",         "number",    "number"),
-    ("ctr",            "CTR (%)",        "number",    "number"),
-    ("cpc",            "CPC",            "number",    "dollar"),
-    ("cpm",            "CPM",            "number",    "dollar"),
-    ("frequency",      "Frequency",      "number",    "number"),
-    ("purchases",      "Purchases",      "number",    "number"),
-    ("purchase_value", "Purchase Value", "number",    "dollar"),
-    ("roas",           "ROAS",           "number",    "number"),
-]
+from typing import Any
 
-# Property used together with "Week Ending" to detect an already-synced row so
-# re-runs update in place instead of creating duplicates.
-DEDUPE_ID_PROP = "Ad ID"
-WEEK_PROP = "Week Ending"
+# Fixed property names.
+DEFAULT_TITLE_PROP = "Ad Name"
+WEEK_START_PROP = "Week Start"
+WEEK_END_PROP = "Week Ending"
+SYNCED_PROP = "Synced On"
+
+# Notion caps title / rich_text content at 2000 characters per item.
+MAX_TEXT = 2000
+
+
+def notion_property_spec(ntype: str, number_format: str | None = None) -> dict[str, Any]:
+    """Return the *schema* definition for a property (used when creating a
+    database or adding a column to one)."""
+    if ntype == "title":
+        return {"title": {}}
+    if ntype == "rich_text":
+        return {"rich_text": {}}
+    if ntype == "date":
+        return {"date": {}}
+    if ntype == "number":
+        return {"number": {"format": number_format or "number"}}
+    raise ValueError(f"Unsupported Notion property type: {ntype}")
+
+
+def notion_property_value(ntype: str, value: Any) -> dict[str, Any]:
+    """Return the *value* payload for a property (used when writing a row)."""
+    if ntype == "title":
+        return {"title": [{"text": {"content": _text(value) or "(unnamed ad)"}}]}
+    if ntype == "rich_text":
+        return {"rich_text": [{"text": {"content": _text(value)}}]}
+    if ntype == "number":
+        return {"number": value if isinstance(value, (int, float)) else None}
+    if ntype == "date":
+        return {"date": {"start": value} if value else None}
+    raise ValueError(f"Unsupported Notion property type: {ntype}")
+
+
+def _text(value: Any) -> str:
+    return ("" if value is None else str(value))[:MAX_TEXT]
