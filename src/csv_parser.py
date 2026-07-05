@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from .customizations import AD_RENAMES, IGNORED_COLUMNS
+from .customizations import AD_RENAMES, IGNORED_COLUMNS, SYNC_REPORTING_WINDOW
 
 log = logging.getLogger(__name__)
 
@@ -156,8 +156,8 @@ def parse_meta_csv(path: str) -> ExportData:
         rows.append(
             {
                 "title": title,
-                "week_start": _cell_date(row, week_start_idx),
-                "week_ending": _cell_date(row, week_end_idx),
+                "week_start": _cell_date(row, week_start_idx) if SYNC_REPORTING_WINDOW else None,
+                "week_ending": _cell_date(row, week_end_idx) if SYNC_REPORTING_WINDOW else None,
                 "fields": fields,
             }
         )
@@ -166,8 +166,10 @@ def parse_meta_csv(path: str) -> ExportData:
         columns=columns,
         rows=rows,
         skipped=skipped,
-        has_week_start=week_start_idx is not None,
-        has_week_ending=week_end_idx is not None,
+        # The reporting-date columns are still detected (and thus excluded from
+        # the generic columns above) even when the window is turned off.
+        has_week_start=week_start_idx is not None and SYNC_REPORTING_WINDOW,
+        has_week_ending=week_end_idx is not None and SYNC_REPORTING_WINDOW,
         title_source_header=headers[title_idx] if headers else None,
     )
 

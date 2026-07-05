@@ -34,21 +34,25 @@ def test_ad_rename_applied():
     assert "SVSC 2026 Ad" not in titles
 
 
-def test_ignored_column_excluded():
+def test_ignored_columns_excluded():
     export = parse_meta_csv(FIXTURE)
     names = {c.name for c in export.columns}
-    # "Attribution setting" is in IGNORED_COLUMNS and must never be synced.
+    # "Attribution setting" and "Currency" are in IGNORED_COLUMNS.
     assert "Attribution setting" not in names
+    assert "Currency" not in names
     for row in export.rows:
         assert "Attribution setting" not in row["fields"]
+        assert "Currency" not in row["fields"]
 
 
-def test_reporting_window_mapped():
+def test_reporting_window_disabled():
+    # SYNC_REPORTING_WINDOW is False in customizations.py, so the Week Start /
+    # Week Ending columns are not produced, and rows carry no window dates.
     export = parse_meta_csv(FIXTURE)
-    assert export.has_week_start and export.has_week_ending
-    row = export.rows[0]
-    assert row["week_start"] == "2026-06-28"
-    assert row["week_ending"] == "2026-07-04"
+    assert not export.has_week_start
+    assert not export.has_week_ending
+    assert export.rows[0]["week_start"] is None
+    assert export.rows[0]["week_ending"] is None
 
 
 def test_numeric_and_text_columns_inferred():
@@ -64,8 +68,6 @@ def test_numeric_and_text_columns_inferred():
     assert by_name["CPC (cost per link click)"].number_format == "dollar"
     # Non-cost number -> plain
     assert by_name["Impressions"].number_format == "number"
-    # Text
-    assert by_name["Currency"].ntype == "rich_text"
 
 
 def test_amount_spent_header_normalised_and_valued():

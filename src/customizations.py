@@ -9,6 +9,7 @@ next sync without touching any other code.
 # The sync will not create these columns, and any values in them are dropped.
 IGNORED_COLUMNS = [
     "Attribution setting",
+    "Currency",
 ]
 
 # Rename ads on the way in: {name as it appears in the CSV: name to use in Notion}.
@@ -17,3 +18,10 @@ IGNORED_COLUMNS = [
 AD_RENAMES = {
     "SVSC 2026 Ad": "Leo talking ad",
 }
+
+# Whether to include the reporting window (Week Start / Week Ending) columns.
+# When False, those columns are never created, and each row is instead
+# identified by its ad name + "Synced On" date (the day the sync runs). Set this
+# back to True to bring the Week Start / Week Ending columns back.
+SYNC_REPORTING_WINDOW = False
+
