@@ -18,12 +18,29 @@ def test_parse_skips_account_total_and_blank():
     # 5 data rows minus the account-total row (blank ad name) = 4 ads.
     assert len(export.rows) == 4
     assert export.skipped == 1
+    # "SVSC 2026 Ad" is renamed to "Leo talking ad" (see customizations.py).
     assert {r["title"] for r in export.rows} == {
-        "SVSC 2026 Ad",
+        "Leo talking ad",
         "Advisor talking ad",
         "Hype Video",
         "Highschool checklist post",
     }
+
+
+def test_ad_rename_applied():
+    export = parse_meta_csv(FIXTURE)
+    titles = {r["title"] for r in export.rows}
+    assert "Leo talking ad" in titles
+    assert "SVSC 2026 Ad" not in titles
+
+
+def test_ignored_column_excluded():
+    export = parse_meta_csv(FIXTURE)
+    names = {c.name for c in export.columns}
+    # "Attribution setting" is in IGNORED_COLUMNS and must never be synced.
+    assert "Attribution setting" not in names
+    for row in export.rows:
+        assert "Attribution setting" not in row["fields"]
 
 
 def test_reporting_window_mapped():
@@ -49,12 +66,11 @@ def test_numeric_and_text_columns_inferred():
     assert by_name["Impressions"].number_format == "number"
     # Text
     assert by_name["Currency"].ntype == "rich_text"
-    assert by_name["Attribution setting"].ntype == "rich_text"
 
 
 def test_amount_spent_header_normalised_and_valued():
     export = parse_meta_csv(FIXTURE)
-    svsc = next(r for r in export.rows if r["title"] == "SVSC 2026 Ad")
+    svsc = next(r for r in export.rows if r["title"] == "Leo talking ad")
     ntype, value = svsc["fields"]["Amount Spent"]
     assert ntype == "number"
     assert value == 195.8

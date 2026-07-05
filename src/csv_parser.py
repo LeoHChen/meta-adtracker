@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from .customizations import AD_RENAMES, IGNORED_COLUMNS
+
 log = logging.getLogger(__name__)
 
 
@@ -110,8 +112,13 @@ def parse_meta_csv(path: str) -> ExportData:
         week_start_idx = week_start_idx if week_start_idx is not None else day_idx
         week_end_idx = week_end_idx if week_end_idx is not None else day_idx
 
+    ignored = {_norm(name) for name in IGNORED_COLUMNS}
     special = {title_idx, week_start_idx, week_end_idx}
-    generic_indices = [i for i in range(len(headers)) if i not in special]
+    generic_indices = [
+        i
+        for i in range(len(headers))
+        if i not in special and _norm(headers[i]) not in ignored
+    ]
 
     # Keep only real data rows: drop blank lines and the account-total row
     # (blank entity/title value).
@@ -136,6 +143,7 @@ def parse_meta_csv(path: str) -> ExportData:
         col_meta[i] = (ntype, number_format, name)
         columns.append(Column(name=name, ntype=ntype, number_format=number_format))
 
+    renames = {_norm(old): new for old, new in AD_RENAMES.items()}
     rows: list[dict[str, Any]] = []
     for row in data:
         fields: dict[str, tuple[str, Any]] = {}
@@ -143,9 +151,11 @@ def parse_meta_csv(path: str) -> ExportData:
             ntype, _fmt, name = col_meta[i]
             raw = row[i] if i < len(row) else ""
             fields[name] = (ntype, _convert(ntype, raw))
+        title = row[title_idx].strip()
+        title = renames.get(_norm(title), title)
         rows.append(
             {
-                "title": row[title_idx].strip(),
+                "title": title,
                 "week_start": _cell_date(row, week_start_idx),
                 "week_ending": _cell_date(row, week_end_idx),
                 "fields": fields,
