@@ -17,6 +17,7 @@ from typing import Any
 import requests
 
 from .csv_parser import ExportData
+from .customizations import ONE_ROW_PER_AD
 from .schema import (
     SYNCED_PROP,
     WEEK_END_PROP,
@@ -115,18 +116,21 @@ class NotionWriter:
         conditions: list[dict[str, Any]] = [
             {"property": self.title_prop, "title": {"equals": row["title"]}}
         ]
-        if export.has_week_ending and row.get("week_ending"):
-            conditions.append(
-                {"property": WEEK_END_PROP, "date": {"equals": row["week_ending"]}}
-            )
-        if export.has_week_start and row.get("week_start"):
-            conditions.append(
-                {"property": WEEK_START_PROP, "date": {"equals": row["week_start"]}}
-            )
-        # No reporting window in the export: fall back to the sync date so a
-        # same-day re-run updates rather than duplicates.
-        if not (export.has_week_start or export.has_week_ending):
-            conditions.append({"property": SYNCED_PROP, "date": {"equals": synced_on}})
+        # ONE_ROW_PER_AD: match on ad name alone, so every sync updates the same
+        # single row per ad. Otherwise scope the match to the reporting period.
+        if not ONE_ROW_PER_AD:
+            if export.has_week_ending and row.get("week_ending"):
+                conditions.append(
+                    {"property": WEEK_END_PROP, "date": {"equals": row["week_ending"]}}
+                )
+            if export.has_week_start and row.get("week_start"):
+                conditions.append(
+                    {"property": WEEK_START_PROP, "date": {"equals": row["week_start"]}}
+                )
+            # No reporting window in the export: fall back to the sync date so a
+            # same-day re-run updates rather than duplicates.
+            if not (export.has_week_start or export.has_week_ending):
+                conditions.append({"property": SYNCED_PROP, "date": {"equals": synced_on}})
 
         payload = self._request(
             "POST",

@@ -20,8 +20,13 @@ AD_RENAMES = {
 }
 
 # Whether to include the reporting window (Week Start / Week Ending) columns.
-# When False, those columns are never created, and each row is instead
-# identified by its ad name + "Synced On" date (the day the sync runs). Set this
-# back to True to bring the Week Start / Week Ending columns back.
+# When False, those columns are never created. Set this back to True to bring
+# the Week Start / Week Ending columns back.
 SYNC_REPORTING_WINDOW = False
+
+# Keep exactly one row per ad, updated in place on every sync (a live view of
+# the latest cumulative numbers), instead of adding a new row each time.
+# "Synced On" then acts as a "last updated" date. Set to False to keep a
+# separate historical row per week instead.
+ONE_ROW_PER_AD = True
 
